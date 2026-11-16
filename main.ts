@@ -67,6 +67,9 @@ import {
 
 /** The wire protocol's version, carried in the register body. */
 const PROTOCOL_VERSION = 1;
+/** The entry's own name and version, printed by `--version` and carried in /healthz. */
+const ENTRY_NAME = 'free-model-aggregator';
+const ENTRY_VERSION = '1.1.0';
 /** How often GET /work is polled, in milliseconds. */
 const POLL_INTERVAL_MS = 100;
 /** The most bytes of one client request body this server reads. */
@@ -87,6 +90,10 @@ const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 const GATEWAY_URL = (process.env.OPENAI_BASE_URL ?? '').replace(/\/+$/, '');
 /** The trial's dummy key for the entry's gateway lane; the gateway swaps it for the entrant's own key. */
 const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? '';
+/** `--quiet` silences the per-request JSON log lines; startup and error lines still print. */
+const QUIET = process.argv.includes('--quiet');
+/** When this process started, in wall-clock milliseconds: the /healthz uptime reading. */
+const STARTED_AT_MS = Date.now();
 
 const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
@@ -103,6 +110,43 @@ const cooledDown = new Set<string>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
+}
+
+/** One answered client request, as the JSON log line on stderr describes it. */
+interface RequestLog {
+  wire: 'openai' | 'anthropic';
+  route: string;
+  model: string | null;
+  status: number;
+  latency_ms: number;
+  upstream_failures: number;
+  streamed: boolean;
+}
+
+/**
+ * The per-request log line: one JSON object on stderr, so an operator can tail a trial
+ * without parsing prose. The graded paths never read it — the answers are built before
+ * this runs — so a slow clock or a missing field cannot change a score, and the line is
+ * dropped whole when `--quiet` is on.
+ */
+function logRequest(entry: RequestLog): void {
+  if (QUIET) return;
+  const line = JSON.stringify({
+    event: 'request',
+    wire: entry.wire,
+    route: entry.route,
+    model: entry.model,
+    status: entry.status,
+    latency_ms: entry.latency_ms,
+    upstream_failures: entry.upstream_failures,
+    streamed: entry.streamed,
+  });
+  process.stderr.write(`aggregator: ${line}\n`);
+}
+
+/** The latency of a request that started at `startedAtMs`, whole milliseconds, never negative. */
+function latencyMs(startedAtMs: number): number {
+  return Math.max(0, Math.round(Date.now() - startedAtMs));
 }
 
 /**
@@ -208,6 +252,42 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
+/**
+ * Whether the gateway answers at all: any HTTP status counts as reachable, only a fetch
+ * that never settles does not. The probe is a plain GET on the gateway's base URL, which
+ * the gateway answers with a 404 or a 405 — either way it proves the route is alive.
+ */
+async function gatewayReachable(): Promise<boolean> {
+  if (GATEWAY_URL === '') return false;
+  try {
+    const probe = await fetch(GATEWAY_URL, { method: 'GET', signal: AbortSignal.timeout(1000) });
+    await probe.arrayBuffer();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * GET /healthz: operator health, never part of a trial and never called by the env.
+ * Status, seconds since this process started, the catalog's model count, and whether
+ * the gateway is configured and answers a probe. The probe has a one-second bound so
+ * a dead gateway cannot stall the answer.
+ */
+async function healthz(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  void req;
+  const reachable = await gatewayReachable();
+  sendJson(res, 200, {
+    status: 'ok',
+    name: ENTRY_NAME,
+    version: ENTRY_VERSION,
+    uptime_s: Math.floor((Date.now() - STARTED_AT_MS) / 1000),
+    catalog_models: servedModels().length,
+    gateway_configured: chatCompletionsUrl() !== '',
+    gateway_reachable: reachable,
+  });
+}
+
 /** The error code of a refused gateway answer: its code, its type, else its HTTP status. */
 async function failureOf(res: Response, model: string): Promise<Failure> {
   let code = `http_${res.status}`;
@@ -297,11 +377,19 @@ function gatewayBody(body: Json, model: string): Json {
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that serves it. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
-  if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const startedAtMs = Date.now();
+  if (body === null) {
+    logRequest({ wire: 'openai', route: '/v1/chat/completions', model: null, status: 400, latency_ms: latencyMs(startedAtMs), upstream_failures: 0, streamed: false });
+    return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  }
   const candidates = candidatesFor(requirementsFromBody(body, 'openai'));
-  if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
+  if (candidates.length === 0) {
+    logRequest({ wire: 'openai', route: '/v1/chat/completions', model: null, status: 503, latency_ms: latencyMs(startedAtMs), upstream_failures: 0, streamed: false });
+    return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
+  }
   const served = await dialWithFailover(candidates, gatewayBody(body, candidates[0].id));
   if (served.upstream === null || served.model === null) {
+    logRequest({ wire: 'openai', route: '/v1/chat/completions', model: null, status: 502, latency_ms: latencyMs(startedAtMs), upstream_failures: served.failures.length, streamed: false });
     return sendError(res, 'openai', 502, 'upstream_error', 'every free model that meets this request refused it', served.failures);
   }
   const { upstream, model, failures } = served;
@@ -318,20 +406,30 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     } finally {
       res.end();
     }
+    logRequest({ wire: 'openai', route: '/v1/chat/completions', model, status: 200, latency_ms: latencyMs(startedAtMs), upstream_failures: failures.length, streamed: true });
     return;
   }
   const answer: unknown = await upstream.json();
   sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, model), failures);
+  logRequest({ wire: 'openai', route: '/v1/chat/completions', model, status: 200, latency_ms: latencyMs(startedAtMs), upstream_failures: failures.length, streamed: false });
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
-  if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const startedAtMs = Date.now();
+  if (body === null) {
+    logRequest({ wire: 'anthropic', route: '/v1/messages', model: null, status: 400, latency_ms: latencyMs(startedAtMs), upstream_failures: 0, streamed: false });
+    return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  }
   const candidates = candidatesFor(requirementsFromBody(body, 'anthropic'));
-  if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
+  if (candidates.length === 0) {
+    logRequest({ wire: 'anthropic', route: '/v1/messages', model: null, status: 503, latency_ms: latencyMs(startedAtMs), upstream_failures: 0, streamed: false });
+    return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
+  }
   const served = await dialWithFailover(candidates, anthropicToOpenAI(gatewayBody(body, candidates[0].id), candidates[0].id));
   if (served.upstream === null || served.model === null) {
+    logRequest({ wire: 'anthropic', route: '/v1/messages', model: null, status: 502, latency_ms: latencyMs(startedAtMs), upstream_failures: served.failures.length, streamed: false });
     return sendError(res, 'anthropic', 502, 'api_error', 'every free model that meets this request refused it', served.failures);
   }
   const { upstream, model, failures } = served;
@@ -348,16 +446,22 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     } finally {
       res.end();
     }
+    logRequest({ wire: 'anthropic', route: '/v1/messages', model, status: 200, latency_ms: latencyMs(startedAtMs), upstream_failures: failures.length, streamed: true });
     return;
   }
   const answer: unknown = await upstream.json();
   sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, model), failures);
+  logRequest({ wire: 'anthropic', route: '/v1/messages', model, status: 200, latency_ms: latencyMs(startedAtMs), upstream_failures: failures.length, streamed: false });
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
   if (req.method === 'GET' && url.pathname === '/v1/models') {
     models(req, res);
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/healthz') {
+    await healthz(req, res);
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
@@ -416,12 +520,33 @@ function poll(server: Server): void {
   }, POLL_INTERVAL_MS);
 }
 
+/**
+ * The routing table as one line: the best free model for a plain request and for each
+ * requirement class, so the startup diagnostics show the decision the trial will make
+ * before the first prompt arrives. The cooldown set is empty at startup, so the order
+ * is the fresh order, identical on a replay.
+ */
+function routingSummary(): string {
+  const pick = (requires: Requirement): string => {
+    const first = candidatesFor(requires)[0];
+    return first === undefined ? 'none' : first.id.replace('openrouter/', '');
+  };
+  return `routing plain→${pick({})} tools→${pick({ tools: true })} json→${pick({ json: true })} vision→${pick({ vision: true })}`;
+}
+
 async function start(): Promise<void> {
   if (brief.error !== null) log(brief.error);
   if (process.argv.includes('--list')) {
     // The same document the register body carries, byte for byte: print the one built object and
     // stop before any server starts. A process whose stdout is not flushed loses the tail, so wait.
     const text = `${JSON.stringify(catalog)}\n`;
+    await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
+    process.exit(0);
+  }
+  if (process.argv.includes('--version')) {
+    // The entry's own name and version, printed the same way --list prints the catalog:
+    // one line on stdout, then stop before any server starts.
+    const text = `${ENTRY_NAME} ${ENTRY_VERSION}\n`;
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
   }
@@ -440,6 +565,7 @@ async function start(): Promise<void> {
   // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
   log(`listening on 0.0.0.0:${port} with ${servedModels().length} free models`);
+  log(`diagnostics: provider ${catalog.providers[0]?.id ?? 'unknown'}, catalog ${servedModels().length} free models, ${routingSummary()}`);
   await register(port, catalog);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
