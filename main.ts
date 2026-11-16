@@ -1,40 +1,41 @@
-// free-model-aggregator-02: one server, two client wires, a real free model behind every answer.
+// free-model-aggregator-02 — one server, two client wires, a live free model per answer.
 //
-// This entry starts from the kit's starter (lib/providers.ts, lib/wire.ts, LICENSE) and replaces
-// its routing, failover and catalog discipline with its own:
+// The entry keeps the kit's starter pieces (lib/providers.ts, lib/wire.ts, LICENSE) and owns
+// the decisions on top of them:
 //
-//   ROUTING (quality, 60% of the score): every request is served by the highest-rated free model
-//   in the brief that meets the request's own requirements (tools, JSON mode, vision). The
-//   requirements are read off the request body itself, never off a manifest index, so the choice
-//   is a function of the request alone. Ties break by context length, then by id: deterministic,
-//   so a replay makes the same choice.
+//   ROUTING, the quality column (60% of the score): a request is served by the best-rated free
+//   model in the brief that can meet what the request itself asks for — tools, JSON mode, vision.
+//   The needs are read out of the request body, never out of a manifest index, so the pick is a
+//   pure function of the request. Ties break on context length, then on id, so a replay picks
+//   the same model every time.
 //
-//   FAILOVER (10%): a gateway refusal (4xx/5xx, or the gateway unreachable) is retried once on
-//   the same model after a fixed 500 ms pause, then the prompt fails over to the next-best
-//   candidate. A model that refuses is cooled down for the rest of the trial: no later prompt
-//   spends a call on it while a fresh candidate remains. Every refusal of the prompt is reported
-//   in the `x-makefun-upstream-failures` header, the only trail the failover column can see.
+//   FAILOVER (10%): when the gateway refuses (4xx/5xx, or it cannot be reached at all) the
+//   prompt is tried once more on the same model after a fixed 500 ms pause, then moves on to
+//   the next-best candidate. A model that refuses is cooled down for the rest of the trial —
+//   no later prompt spends a call on it while a fresh candidate is left. Every refusal the
+//   prompt met is reported in the `x-makefun-upstream-failures` header, the only trail the
+//   failover column can see.
 //
-//   CATALOG (5%): the catalog is exactly the brief's fourteen free ids, registered byte for byte
-//   as `--list` prints it, and both GET /v1/models answers list exactly that set.
+//   CATALOG (5%): the catalog is exactly the brief's fourteen free ids, registered byte for
+//   byte as `node main.ts --list` prints it, and both shapes of GET /v1/models list the same set.
 //
-//   DETERMINISM: no wall clock, no unseeded randomness. Every choice derives from the brief, the
-//   request, and the gateway answers seen so far, so a replay leaves the same state export.
+//   DETERMINISM: no wall clock, no unseeded randomness. Every choice follows from the brief,
+//   the request, and the gateway answers seen so far, so a replay leaves the same state export.
 //
-// WHAT A TRIAL GIVES YOU
-//   The env is at $MAKEFUN_ENV_URL; model calls go through the grader's gateway at
-//   $OPENAI_BASE_URL, an OpenAI-compatible endpoint that reaches OpenRouter on the key pushed to
-//   the competition. The brief at $MAKEFUN_PROMPT_FILE carries the free model list (gateway id,
-//   rating_milli, capabilities) and the six prompts' manifest. The server:
-//     1. listens on 0.0.0.0 at a free port (never 8080: the env itself is there on one layout);
+// WHAT ONE TRIAL LOOKS LIKE
+//   The env lives at $MAKEFUN_ENV_URL; model calls go through the grader's gateway at
+//   $OPENAI_BASE_URL, an OpenAI-compatible endpoint that reaches OpenRouter on the key pushed
+//   to the competition. The brief at $MAKEFUN_PROMPT_FILE carries the free model list (gateway
+//   id, rating_milli, capabilities) and the six prompts' manifest. The server:
+//     1. listens on 0.0.0.0 at a free port (never 8080 — the env itself sits there on one layout);
 //     2. POSTs $MAKEFUN_ENV_URL/register {"protocol_version": 1, "port": <port>, "catalog": <catalog>};
 //     3. serves GET /v1/models (x-api-key means Anthropic, Authorization means OpenAI),
 //        POST /v1/chat/completions and POST /v1/messages, JSON or server-sent events;
-//     4. answers each prompt by dialling ONE free model through the gateway. OPENAI_API_KEY in the
-//        sandbox is a dummy the gateway swaps for the entrant's own key; the real key never enters
-//        the sandbox. A request that arrives on /v1/messages is translated to Chat Completions and
-//        the answer translated back; every `model` field names the id actually dialled (the
-//        provider's own answer spells it without the gateway's `openrouter/` prefix);
+//     4. answers each prompt by dialling ONE free model through the gateway. OPENAI_API_KEY in
+//        the sandbox is a dummy the gateway swaps for the entrant's own key; the real key never
+//        enters the sandbox. A request that arrives on /v1/messages is translated to Chat
+//        Completions and the answer translated back; every `model` field names the id actually
+//        dialled (the provider's own answer spells it without the gateway's `openrouter/` prefix);
 //     5. polls GET $MAKEFUN_ENV_URL/work every 100 ms and exits 0 when the env says {"done": true}.
 //   `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts.
 
@@ -64,7 +65,7 @@ import {
   type ServedModel,
 } from './lib/wire.ts';
 
-/** The wire protocol's version, in the register body. */
+/** The wire protocol's version, carried in the register body. */
 const PROTOCOL_VERSION = 1;
 /** How often GET /work is polled, in milliseconds. */
 const POLL_INTERVAL_MS = 100;
@@ -105,8 +106,9 @@ function log(message: string): void {
 }
 
 /**
- * The gateway's Chat Completions route. OPENAI_BASE_URL is the OpenAI-compatible root (`…/v1` on the
- * trial network); a base that does not already end in `/v1` gets one, so both spellings reach the route.
+ * The gateway's Chat Completions route. OPENAI_BASE_URL is the OpenAI-compatible root (`…/v1` on
+ * the trial network); a base that does not already end in `/v1` gets one, so both spellings
+ * reach the route.
  */
 function chatCompletionsUrl(): string {
   if (GATEWAY_URL === '') return '';
@@ -119,9 +121,9 @@ function servedModels(): ServedModel[] {
 }
 
 /**
- * The candidates for a request: the free models meeting its requirements, best first. Order is the
- * whole routing decision: rating first (quality is 60% of the score), then the wider window, then
- * the id, so the order is total and identical on a replay.
+ * The candidates for a request: the free models meeting its requirements, best first. The order
+ * is the whole routing decision: rating first (quality is 60% of the score), then the wider
+ * window, then the id, so the order is total and identical on a replay.
  */
 function candidatesFor(requires: Requirement): ModelRow[] {
   const fresh: ModelRow[] = [];
@@ -231,8 +233,8 @@ function pause(ms: number): Promise<void> {
 }
 
 /**
- * Dial the gateway once for one model. Returns the response on any HTTP answer; throws only when
- * the gateway cannot be reached at all or the call times out.
+ * Dial the gateway once for one model. Returns the response on any HTTP answer; throws only
+ * when the gateway cannot be reached at all or the call times out.
  */
 async function dialOnce(model: string, body: Json): Promise<Response> {
   const headers: Record<string, string> = {
@@ -249,11 +251,11 @@ async function dialOnce(model: string, body: Json): Promise<Response> {
 }
 
 /**
- * Dial a prompt through the gateway, failing over down the candidate list. Each candidate is tried
- * once, then once more after a fixed pause when it refuses with a 429 or a 5xx; a model that still
- * refuses is cooled down for the rest of the trial. Returns the first successful upstream response
- * with the model that served it; on total failure the upstream and model are null, and every
- * refusal is still returned, so the 502 answer can carry the trail.
+ * Dial a prompt through the gateway, failing over down the candidate list. Each candidate is
+ * tried once, then once more after a fixed pause when it refuses with a 429 or a 5xx; a model
+ * that still refuses is cooled down for the rest of the trial. Returns the first successful
+ * upstream response with the model that served it; on total failure the upstream and model are
+ * null, and every refusal is still returned, so the 502 answer can carry the trail.
  */
 async function dialWithFailover(
   candidates: ModelRow[],
@@ -417,8 +419,8 @@ function poll(server: Server): void {
 async function start(): Promise<void> {
   if (brief.error !== null) log(brief.error);
   if (process.argv.includes('--list')) {
-    // The same document the register body carries, byte for byte: print the one built object and stop
-    // before any server starts. A process whose stdout is not flushed loses the tail, so wait for it.
+    // The same document the register body carries, byte for byte: print the one built object and
+    // stop before any server starts. A process whose stdout is not flushed loses the tail, so wait.
     const text = `${JSON.stringify(catalog)}\n`;
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
